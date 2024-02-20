@@ -1,0 +1,10 @@
+services:
+  rstudio:
+    image: single_cell
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "80:8787"
+    volumes:
+      - /home/:/home/:rw 

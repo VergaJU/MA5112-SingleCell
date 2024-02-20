@@ -1,0 +1,522 @@
+---
+title: "MA5112_scRNA-Seq"
+author:
+  - name^[email]
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Single cell RNA-Seq
+
+Single cell RNA sequencing (scRNA-Seq), as the name suggests, allows to examine RNA sequence information from individual cells. In contrast to traditional bulk RNA sequencing, which provides an average expression profile of a heterogeneous cell population, scRNA-seq allows researchers to dissect the intricacies of cellular diversity within a sample. This technology offers a high-resolution view of cellular heterogeneity, uncovering rare cell types, identifying transcriptional signatures, and elucidating dynamic gene expression patterns.The higer resolution allows a number of analysis, such as transcriptome and mutational characterization of cell types of interest, sub-clone tracing, pseudotime analysis to study dynamic gene regulatory programs along continuous biological processes.
+
+
+![](https://carpentries-incubator.github.io/scrna-seq-analysis/fig/slide-juice.png)
+
+
+Various library preparation methods have been developed for single-cell RNA sequencing, and while they differ in specific protocols, a common approach involves barcoding transcripts within individual cells. This process typically includes attaching unique molecular identifiers (UMIs) or barcodes to capture the origin of each RNA molecule. Following barcoding, complementary DNA (cDNA) is synthesized, and the resulting libraries are sequenced to profile gene expression at the single-cell level. 
+
+
+In today's practical session, we will be analyzing samples obtained using the 10X Chromium method, which is a droplet-based scRNA-seq approach. In a droplet-based method, individual cells are encapsulated into tiny water-in-oil droplets along with unique barcoded beads and reagents. Each droplet serves as a micro-reaction chamber where cell lysis, reverse transcription, and barcoding of RNA molecules occur independently for each cell. The resulting barcoded cDNA from multiple cells is then pooled together for downstream library preparation and sequencing. 
+
+
+![](https://dnacore.missouri.edu/images/10xschematic.jpg)
+
+Today's analysis centers around bone marrow (BM) samples. We selected this tissue for its distinctive properties, is recognized for its intrinsic cellular diversity. Comprising hematopoietic stem cells, immune cells, and stromal cells, the bone marrow presents a rich and heterogeneous microenvironment. In the specific we are going to compare 3 healthy samples and 3 samples from patients affected by multiple Myeloma.
+
+To ease the analysis and, because we already ran the alignment last semester, we are going to load the samples as count matrices. Similarly to the count matrix we saw last semester, here we have big matrices, with a row for each gene and a column for each cell. To these matrices, we will add additional tables with additional information for each cell or gene.
+
+![](https://bioconductor.org/books/3.13/OSCA.intro/images/SingleCellExperiment.png)
+
+
+## Load libraries
+
+Firstly we are going to load all the libraries we will need to carry on the analysis. We are going to use [Seurat](https://satijalab.org/seurat/) as main tool to hande and analyse scRNA-Seq data.
+
+```{r packages}
+# load libraries
+suppressMessages(library(tidyverse))
+suppressMessages(library(Seurat))
+suppressMessages(library(SingleR))
+suppressMessages(library(ggsignif))
+suppressMessages(library(clusterProfiler))
+suppressMessages(library(org.Hs.eg.db))
+suppressMessages(library(ggrepel))
+suppressMessages(library(patchwork))
+suppressMessages(library(BiocParallel))
+multicoreParam <- MulticoreParam(workers = 4)
+```
+
+## Load files
+
+As first step we have to load the count matrix for each sample and convert them to a Seurat object.
+
+
+```{r}
+
+# List all the files in the directory "files"
+files <- list.files("../files/")
+
+```
+
+Now with a for loop we are going to import the sample files and convert them in a seurat object. 
+
+```{r warning=FALSE}
+# create an empty list named samples
+samples <- list()
+
+# for each sample listed in files, import the count matrix using Read10X() and convert it in a Seurat object with CreateSeuratObject()
+## to keep track of each sample, we add to the metadata the origin of each cell
+for (sample in files) {
+  sample_name =  sub("\\..*$", "", sample)
+  samples[sample_name] <- readRDS(paste0("../files/", sample))
+  samples[[sample_name]]@meta.data["sample"] <- sample
+}
+```
+
+Let's have a look of the structure of a Seurat object:
+
+```{r}
+# Print information first sample
+samples$cancer_1
+```
+
+The data is stored as a Seurat object, with 36,601 genes and 5,907 cells. We can find more information about each of the cells in the meta.data attribute of the Seurat object.
+
+```{r}
+# print first lines of the metadata from the first sample
+head(samples$cancer_1@meta.data)
+```
+
+
+Here we can see the row names linking each cell to it's metadata, we set the 'sample' column to keep track of where the cells come from. Then we have 2 columns providing key features of our cells:
+
+- `nCountRNA`: is the number of UMI for each cell, it identifies how transcripts have been found in each cell
+- `nfeatureRNA`: is the number of genes identified for each single cell
+
+Now we can proceed merging our datasets so we have to work with a single object:
+
+```{r}
+# merge all the data updating the cell ids with the name of the sample where they come from
+dat <- merge(samples[[1]], y = samples[2:length(samples)], add.cell.ids = names(samples))
+# merge the count layers together
+dat <- JoinLayers(dat)
+# remove the lsit of samples to reduce memory consumption
+rm(samples)
+dat
+
+```
+
+## Quality control
+
+Now we have our dataset, we still have to clean it. With 10X Chromium, it can happen to have empty droplets, where contaminating RNA is barcoded, dorplets with more than one cell, resulting in a douplet, or to barcode dying cell, which we aren;t interestd in.
+
+So to exert the quality control, we will base on 3 main metrics:
+- `nCountRNA`:Cells with unusually high counts could represent doublets (where more than one cell gets caught in a droplet and tagged with the same barcode) and cells with unusually low counts could represent empty droplets (where ambient RNA from cells that have lysed in the cell suspension gets caught in a droplet and tagged with a barcode).
+- `nFeature_RNA`: Similar to counts - cells with high genes could be doublets and cells with low genes could be empty droplets. Usually, `nCount_RNA` and `nFeature_RNA` are combined into one filter e.g. remove cells with counts <= 500 & genes <= 200.
+- `percent_mt`: This value represents the percentage of counts in a cell that map to the mitochondrial genome. Cells with high mitochondrial gene percentage can represent stressed or dying cells, where the cell has lysed prior to droplet generation and most of the nuclear mRNA has leaked out but the mitochondrial mRNA will still be present inside the mitochondria.
+
+Samples are typically QC-ed one by one and filters are decided for each sample by examining the distribution of the QC metrics above to decide on reasonable thresholds.
+
+```{r fig.height=8, fig.width=15, warning=FALSE}
+# first calculate the mitchondrial percentage for each cell
+dat$percent_mt <- PercentageFeatureSet(dat, pattern="^MT.")
+# make QC plots
+VlnPlot(dat, features = c("nCount_RNA", "nFeature_RNA", "percent_mt"), group.by="sample")
+```
+
+
+
+From the violin plot we can see some interesting distributions:
+
+- In both `nCount_RNA` and `nFeature_RNA` we have a bi modal distribution, with a group of cells with low counts/features and a second croup with more counts/features:
+  - The cells in the lower part of the graph are likely to be empty droplets
+- Some cells reach very high amount of counts and features, detaching from the main group of cells:
+  - These cells are likely to be doublets
+- While most of the cells have an amount of mitochondrial RNA below 15%, some peak up to 75%
+  - these cells could be stressed or dying cells
+
+
+So let's set some threshold and clean our dataset:
+
+```{r fig.height=8, fig.width=15, warning=FALSE}
+# set min max counts and mt_rna:
+mt_rna <- 15
+min__counts <- 500
+max_counts <- 15000
+min_features <- 500
+
+## clean the dataset and plot the new distribution
+dat_clean = subset(dat, subset= percent_mt < mt_rna & nCount_RNA > min__counts & nCount_RNA < max_counts & nFeature_RNA > min_features)
+VlnPlot(dat_clean, features = c("nCount_RNA", "nFeature_RNA", "percent_mt"), group.by="sample")
+
+```
+
+Now the quality metrics looks better, we don't have group of cells lying on the bottom of the graph or cells with almost only mitochondrial RNA. But, we can see that the samples differs eachother, this could derive from the different condition where each sample has been collected or processed. 
+
+### Questions 1:
+
+- Do you think the dataset is cleaned enough?
+- In your opinion, which other metrics could be used to exert the quality control?
+
+```{r results='hide'}
+#overwrite dat object to save space
+dat <- dat_clean
+# remove genes with 0 counts
+dat <- dat[rowSums(dat@assays$RNA@layers$counts) > 0,]
+
+## add a column in the metadata with the condition of each sample:
+df <- dat@meta.data %>%
+  mutate(condition = sub("_[0-9]\\..*$", "", sample))
+
+dat <- AddMetaData(dat, df["condition"])
+
+# clean the unused memory
+rm(dat_clean)
+invisible(gc())
+```
+
+
+To solve this issue we have proceed with other 2 key steps for the analysis of data from different sources:
+
+- Normalisation
+- Batch correction
+
+## Normalisation 
+
+After removing unwanted cells from the dataset, the next step is to normalise the data. By default, Seurat uses a global-scaling normalisation method “LogNormalize” that normalises the gene expression measurements for each cell by the total expression, multiplies this by a scale factor (10,000 by default), and log-transforms the result.
+
+```{r}
+dat <- NormalizeData(dat)
+```
+
+The normalised data and the raw counts are both stored in Seurat object but by default, Seurat will use the normalised values for any downstream analysis.
+
+
+## Cell type identification
+
+
+Now we have clean the dataset and normalised the counts, we can proceed with assigning the cell typ to each of our cells. There are multiple approaches out there for labelling cells but most of them fall into one of the following two categories:
+
+- Looking at expression of known marker genes in different clusters and labelling cells accordingly.
+- Comparing your dataset to a reference dataset from the same tissue and predicting cell type labels based on the reference.
+
+In our case we are going to use the second. In the folder "/home/reference" we have an already annotated scRNA-Seq dataset from BM. The [authors](https://www.nature.com/articles/s41587-019-0332-7), used scRNA-Seq, CITE-Seq and ATAC-Seq to identify the cell types in their samples, we are going to use this well annotated dataset to annotate our cells. We are going to use [SingleR](https://bioconductor.org/packages/release/bioc/html/SingleR.html).
+
+```{r}
+# load the reference dataset
+ref <- readRDS("../reference/reference.rds")
+
+table(ref@meta.data$celltype)
+
+```
+
+
+```{r warning=FALSE}
+
+label_cell_types <- function(dat,ref){
+  # Convert the object in SingleCellExpreiment objects
+  dat1 <- as.SingleCellExperiment(dat)
+  ref1 <- as.SingleCellExperiment(ref)
+  
+  # run SingleR
+  pred <- SingleR(test=dat1, ref=ref1, labels=ref1[["celltype"]], de.method="wilcox", assay.type.test = 'counts', assay.type.ref = 'counts', BPPARAM=multicoreParam)
+  
+  # save the predicted labels in a dataframe and add it as metadata of our single cell object
+  df <- data.frame(label = pred$labels)
+  rownames(df) <- rownames(pred)
+  dat <- AddMetaData(dat, df)
+  # return the updated Seurat object
+  return(dat)
+}
+
+# label cells
+dat <- label_cell_types(dat,ref)
+
+# remove reference and clean unused memory
+rm(ref)
+invisible(gc())
+
+```
+
+## Cell type proportions
+
+To investigate how the immune micro-environment is altered in Multiple Myeloma we can compare the cell type composition in normal and cancer tissue. We use proportions rather than absolute number of cells as the number of cells captured for each sample will vary hugely due to technical factors.
+
+
+
+```{r fig.height=10, fig.width=10, warning=FALSE}
+# calculate percentages for each cell type in each sample
+plot_df <- dat@meta.data %>% 
+  dplyr::select(sample, condition, label) %>% 
+  group_by(sample, condition, label) %>% 
+  tally() %>% ungroup() %>% group_by(sample) %>% 
+  mutate(per = n/sum(n))
+
+# plot results
+ggplot(plot_df, aes(x = condition, y = per, fill = condition)) +
+  geom_boxplot(outlier.alpha = 0, col = 'black') +
+  geom_jitter() +
+  geom_signif(comparisons = list(c("healthy", "cancer")), test = "t.test", 
+              margin_top = 0.01) + # performs wilcoxon test to generate p values
+  geom_point(aes(y = per * 1.1), alpha = 0) +
+  scale_y_continuous(labels = function(x) scales::percent(x, accuracy = 0.1)) +
+  scale_fill_manual(values = c(healthy = '#FFB901', cancer = '#6966CD'), name = 'Condition') +
+  labs(x = NULL, y = 'Percentage of all cells', title = 'Changes in cell type proportions') +
+  facet_wrap(~label, scales = 'free', nrow = 5) +
+  coord_cartesian(clip = 'off') +
+  theme_minimal(base_size = 12) +
+  theme(axis.text = element_text(colour = 'black'),
+        strip.text = element_text(margin = margin(b = 10), colour = 'black'),
+        axis.ticks = element_line(colour = 'gray20'),
+        legend.position = 'bottom',
+        plot.title = element_text(hjust = 0.5))
+```
+
+### Questions 2:
+
+- Which are the cell types whose proportions are statistically significant between the conditions? 
+- Do you believe that the sample size (number of observations) is sufficient to draw meaningful conclusions from the test results?
+- How confident are you in the reliability of the statistical test results, given the observed variance in our data?
+
+
+
+## Batch integration
+
+Using experiments from different patients and sources could bring a batch effect. The differences coming fro different batches could drive some of our analysis where, instead of highlighting the biological differences between our conditions, we highlights the differences due to the different experimental condition.
+
+Seurat has its own method for integrating cells from different datasets/batches which uses canonical correlation analysis (CCA) to identify ‘anchors’ between the datasets, which are then used to align them.
+
+So far we’ve been treating the dataset as a single batch. To perform batch effect correction on the dataset we need to split the Seurat object into a list of Seurat objects - one for each patient - and process them individually.
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+sample_names <- unique(dat@meta.data[["sample"]])
+
+# Initialize an empty list to store Seurat objects
+seurat_objects_list <- list()
+
+# Split the Seurat object into a list of objects based on sample names
+for (sample_name in sample_names) {
+  seurat_objects_list[[sample_name]] <- subset(dat, cells=rownames(dat@meta.data)[dat@meta.data$sample == sample_name])
+}
+
+# normalise and identify variable features for each batch independently
+seurat_objects_list <- lapply(X = seurat_objects_list, FUN = function(x) {
+    x <- NormalizeData(x, verbose = F)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 4000)
+})
+
+# select features that are repeatedly variable across datasets for integration
+features <- SelectIntegrationFeatures(object.list = seurat_objects_list, verbose = F)
+```
+
+
+We can now use the `FindIntegrationAnchors()` function to identify features that are highly correlated across batches (‘anchors’). This step may take a few minutes to run.
+
+
+```{r}
+anchors <- FindIntegrationAnchors(object.list = seurat_objects_list, anchor.features = features, verbose = F)
+```
+
+
+The anchors are then used as input to the `IntegrateData()` function to create a new Seurat object with an ‘integrated’ assay, which contains the batch corrected values.
+
+```{r message=FALSE, warning=FALSE}
+dat.combined <- IntegrateData(anchorset = anchors) # create integrated seurat object
+DefaultAssay(dat.combined) <- 'integrated' # set default assay to 'integrated' - the uncorrected values are still present in 'RNA'
+dat.combined@assays$integrated@data[1:4, 1:4]
+```
+
+You’ll notice the corrected assay contains negative values. These values should not be treated as traditional gene expression values and should not be used for things like differential expression analysis but can be used for constructing an integrated graph.
+
+```{r}
+# assign the integrated data to a new assay in the original object
+dat@assays$integrated <- dat.combined@assays$integrated
+# remove integrated data to save memory
+rm(dat.combined)
+invisible(gc())
+```
+
+
+## Feature selection
+
+In order to extract meaningful biological signals from the dataset, Seurat aims to identify a subset of features (e.g. genes) exhibiting high variability across cells, and therefore represent heterogeneous features to prioritise for downstream analysis. Choosing genes solely based on their log-normalised single-cell variance fails to account for the mean-variance relationship that is inherent to single-cell RNA-seq. Therefore, a variance-stabilising transformation is applied to correct for this before calculating the mean-variance relationship, implemented in the `FindVariableFeatures()` function.
+
+```{r}
+# find the 4000 most variable genes
+dat <- FindVariableFeatures(dat, selection.method = "vst", nfeatures = 4000)
+head(VariableFeatures(dat), 20)
+```
+
+
+## Dimensionality reduction
+
+The next task is to visualise the dataset. To do this we need to reduce the dimensionality of the data, as there’s no way we can visualise ~14,000 dimensions. PCA is typically used first to reduce the data to around 15 dimensions and then more complex algorithms such as tSNE or UMAP can be used to reduce to 2 dimensions and visualise the data.
+
+
+Prior to performing dimensionality reduction techniques such as PCA, the dataset is centered and scaled. What this process does is:
+
+- Shift the expression of each gene, so that the mean expression across cells is 0.
+
+- Scale the expression of each gene, so that the variance across cells is 1.
+
+This step gives equal weight in downstream analyses, so that highly-expressed genes do not dominate. After performing scaling, the results are stored in `dat.merged[["RNA"]]@scale.data`.
+
+```{r}
+# scale all genes, not just HVGs
+all.genes <- rownames(dat)
+dat <- ScaleData(dat, features = all.genes, assay = "integrated") # note we are scaling the integrated values, where we applied the batch effect correction
+dat@assays$integrated$scale.data[1:10, 1:10]
+```
+
+```{r}
+invisible(gc())
+```
+
+
+### PCA
+
+
+PCA will be performed on the highly variable genes.
+
+```{r}
+# this will take a few minutes to run
+dat <- RunPCA(dat, features = VariableFeatures(object = dat), layer= "scale.data",assay = "integrated", verbose = F)
+```
+We can check which genes contribute to each of the principal components.
+
+```{r}
+print(dat[["pca"]], dims = 1:2, nfeatures = 5)
+```
+
+We can also visualise the principal components as scatter plots.
+
+```{r}
+DimPlot(dat, reduction = "pca", dim = 1:2)
+```
+
+
+```{r}
+DimPlot(dat, reduction = "pca", dim = 2:3)
+```
+
+The reason PCA is performed is to compress the dataset into a robust representation of the heterogeneity present in the dataset for downstream clustering, however now we are faced with an issue: how many PCs to include for downstream analyses?
+
+The easiest (and quickest) way to decide this is with an elbow plot - a ranking of principle components based on the percentage of variance explained by each PC.
+
+```{r}
+ElbowPlot(dat)
+```
+
+From this plot we might conclude that taking the top 10 PCs makes the most sense as not much more variance is explained by including any PCs after 10.
+
+
+### UMAP 
+
+Both UMAP and tSNE are forms of graph-based clustering. The first step in this process is to construct a KNN graph based on the euclidean distance in PCA space, and refine the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity). This step is performed using the `FindNeighbors()` function, and takes as input the previously defined dimensionality of the dataset (we will include the top 10 PCs here).
+
+```{r}
+# construct knn graph
+dat <- FindNeighbors(dat, dims = 1:10)
+```
+
+his graph can now be used as input for the `RunUMAP()` function. The goal of this algorithm is to learn the underlying manifold of the data in order to place similar cells together in low-dimensional space.
+
+```{r warning=FALSE}
+dat <- RunUMAP(dat, dims = 1:10)
+```
+
+```{r}
+DimPlot(dat, reduction = 'umap')
+```
+
+
+```{r fig.height=10, fig.width=10}
+DimPlot(dat, reduction = 'umap', group.by = c('sample', 'condition', 'label'), ncol = 2)
+```
+
+### Questions 3:
+
+- Are the data integrated correctly? do we removed completely the batch effect?
+- The division between cell types make sense in your opinion?
+
+Suggestion: looking at the [documentation](https://satijalab.org/seurat/reference/dimplot), you can customize the plots and have a better perspective of your data.
+
+
+## Differential expression analysis
+
+We can also look at differential expression of genes to see which cell types are altered in the tumour micro-environment. The `FindMarkers()` function in Seurat can be used to identify DEGs between conditions for each cell type. This function implements a wilcoxon test by default.
+
+
+```{r}
+# for each cell type, get list of DEGs between normal and tumour tissue
+deg_df <- data.frame()
+for(i in unique(dat$label)){
+  sub <- dat[, dat$label == i]
+  tryCatch({
+    degs <- FindMarkers(sub, assay = 'RNA', group.by = 'condition', ident.1 = 'healthy', ident.2 = 'cancer', features = features)
+    degs <- degs %>% rownames_to_column(var = 'gene') %>% mutate(cell = i)
+    deg_df <- rbind(deg_df, degs)
+  }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+}
+```
+```{r}
+# make volcano plots of results
+ggplot(deg_df, aes(x = avg_log2FC, y = -log10(p_val_adj), col = p_val_adj <= 0.05)) +
+  geom_point(show.legend = F, size = 0.5) +
+  scale_shape_manual(values = c(20,19)) +
+  scale_color_manual(values = c('#FFC46B', '#FF7F37')) +
+  theme_minimal() +
+  theme(strip.background = element_rect(colour = 'black')) +
+  facet_wrap(~cell, nrow = 4)
+```
+
+
+### Questions 4:
+
+- Which cell types show significant change in gene expression between tumour and normal samples?
+- Why do we have 3 errors (check boxplots)?
+
+## GO enrichment
+
+We can use the `ClusterProfiler` R package to try and figure out what biological processes these genes might be involved in. Considering the volcano plots, and eventually [Multiple Myeloma characteristics](https://www.cancer.ie/cancer-information-and-support/cancer-types/multiple-myeloma), select a cell type to run the Gene Ontology enrichment analysis on the differentially expressed genes.
+
+```{r}
+### modify cell_type with a cell type that shows significant change in gene expression
+
+cell_type = "Plasma"
+
+all_genes <- rownames(dat[["RNA"]]$counts)
+
+mono_genes <- deg_df %>% filter(cell == cell_type, abs(avg_log2FC) >= 0.25, p_val_adj <= 0.05) %>% pull(gene)
+
+go_mono <- enrichGO(gene = mono_genes, universe = all_genes, OrgDb = org.Hs.eg.db, keyType = 'SYMBOL', ont = "BP")
+
+ggplot(data.frame(go_mono) %>% filter(qvalue <= 0.05) %>% slice_min(order_by = qvalue, n = 10) %>% mutate(Description = fct_rev(fct_inorder(Description))), aes(y = Description, x = -log10(qvalue), col = Count)) +
+  geom_point(size = 3) +
+  scale_colour_distiller(palette = 'PuRd', limits = c(0,12), direction = 1) +
+  labs(title = paste0('GO terms enriched among genes differentially expressed by ', cell_type)) +
+  theme_minimal() +
+  theme(plot.title.position = 'plot',
+        plot.title = element_text(hjust = 0.5))
+```
+
+# Summary
+
+- Write the answers to the questions asked during the practice
+- Expany which cell type you select after the differential gene expression analysis and what the GO Enrichment plot tell us about it's differentially expressed genes.
+- feel free to create new plots to have better idea of the results
+
+
